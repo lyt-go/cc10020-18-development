@@ -14,12 +14,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 # 将backend目录加入路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.persistence import json_store
+import app.persistence
+from app.persistence import JsonStore, json_store
 from app.services.api_endpoint import ApiEndpointService
 from app.services.webhook_channel import WebhookChannelService
 from app.services.event_schema import EventSchemaService
@@ -38,6 +40,64 @@ from app.services.incre_cursor import IncreCursorService
 from app.services.backfill_job import BackfillJobService
 from app.services.event_archive import EventArchiveService
 from app.services.integration_monitor import IntegrationMonitorService
+
+
+_TEMP_STORE_CTX = None
+_ORIGINAL_GLOBAL_STORE = None
+_SERVICE_MODULES = []
+
+
+def setUpModule():
+    """整个模块切到独立临时存储，避免与其他测试文件共享磁盘数据。
+
+    服务模块以 from-import 持有 json_store，因此把各服务模块内的引用
+    统一重绑到临时实例，测试与服务访问同一份隔离存储。
+    """
+    global _TEMP_STORE_CTX, _ORIGINAL_GLOBAL_STORE, _SERVICE_MODULES
+    import app.persistence
+    import app.services.base as base_mod
+    import app.services.api_endpoint as api_mod
+    import app.services.webhook_channel as wh_mod
+    import app.services.event_schema as es_mod
+    import app.services.mq_consumer as mq_mod
+    import app.services.dlq_handler as dlq_mod
+    import app.services.api_auth_store as aas_mod
+    import app.services.rate_limit_config as rlc_mod
+    import app.services.data_transform as dt_mod
+    import app.services.dispatch_rule as dr_mod
+    import app.services.dedup_filter as df_mod
+    import app.services.batch_ingest as bi_mod
+    import app.services.data_lake_sink as sink_mod
+    import app.services.data_quality_rule as dq_mod
+    import app.services.call_trace_log as ctl_mod
+    import app.services.incre_cursor as ic_mod
+    import app.services.backfill_job as bj_mod
+    import app.services.event_archive as ea_mod
+    import app.services.integration_monitor as im_mod
+
+    _SERVICE_MODULES = [base_mod, api_mod, wh_mod, es_mod, mq_mod, dlq_mod, aas_mod, rlc_mod,
+                        dt_mod, dr_mod, df_mod, bi_mod, sink_mod, dq_mod, ctl_mod,
+                        ic_mod, bj_mod, ea_mod, im_mod]
+    _ORIGINAL_GLOBAL_STORE = app.persistence.json_store
+    _TEMP_STORE_CTX = tempfile.TemporaryDirectory()
+    temp_store = JsonStore(base_dir=_TEMP_STORE_CTX.name)
+    app.persistence.json_store = temp_store
+    # 测试模块自身的 from-import 绑定也切到临时存储
+    globals()["json_store"] = temp_store
+    for mod in _SERVICE_MODULES:
+        mod.json_store = temp_store
+
+
+def tearDownModule():
+    global _TEMP_STORE_CTX
+    import app.persistence
+    if _TEMP_STORE_CTX is not None:
+        _TEMP_STORE_CTX.cleanup()
+        _TEMP_STORE_CTX = None
+    for mod in _SERVICE_MODULES:
+        mod.json_store = _ORIGINAL_GLOBAL_STORE
+    app.persistence.json_store = _ORIGINAL_GLOBAL_STORE
+    globals()["json_store"] = _ORIGINAL_GLOBAL_STORE
 
 
 class TestDataPersistence(unittest.TestCase):

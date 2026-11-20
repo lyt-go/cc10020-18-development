@@ -73,6 +73,7 @@ class DataQualityRuleService(BaseModuleService):
             passed = check_result.get("passed", True) and range_check.get("passed", True)
             detail = {
                 "rule_no": rule.get("规则编号"),
+                "rule_version": rule.get("规则版本", "v1"),
                 "field": field,
                 "expression": expression,
                 "passed": passed,

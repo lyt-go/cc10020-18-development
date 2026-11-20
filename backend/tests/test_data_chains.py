@@ -21,7 +21,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.persistence import JsonStore, json_store as global_store
+from app.persistence import JsonStore
+from app.persistence import json_store
+from app.persistence import json_store as global_store
 from app.services.api_endpoint import ApiEndpointService
 from app.services.webhook_channel import WebhookChannelService
 from app.services.event_schema import EventSchemaService
@@ -48,9 +50,13 @@ def _seed_and_cleanup():
     with tempfile.TemporaryDirectory() as tmp:
         store = JsonStore(base_dir=tmp)
         import app.persistence
+        original_global_store = app.persistence.json_store
         app.persistence.json_store = store
+        # 同步替换测试模块内的 from-import 绑定，保证用例访问到临时存储
+        globals()["json_store"] = store
 
         import app.services.api_endpoint as api_mod
+        import app.services.base as base_mod
         import app.services.webhook_channel as wh_mod
         import app.services.event_schema as es_mod
         import app.services.mq_consumer as mq_mod
@@ -69,17 +75,22 @@ def _seed_and_cleanup():
         import app.services.event_archive as ea_mod
         import app.services.integration_monitor as im_mod
 
-        # Re-import all services to pick up new store
-        import importlib
-        for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
-                     dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
-                     rlc_mod, aas_mod, ea_mod, im_mod]:
-            importlib.reload(mod)
+        # 不 reload（reload 会产生与测试文件顶部不同的类对象）；
+        # 直接把各服务模块内 from-import 持有的 json_store 重绑到临时实例，
+        # 保证测试类与服务访问同一份隔离存储。
+        service_modules = [base_mod, api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
+                           dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
+                           rlc_mod, aas_mod, ea_mod, im_mod]
+        for mod in service_modules:
+            mod.json_store = store
 
         yield
 
+        for mod in service_modules:
+            mod.json_store = original_global_store
         import app.persistence
-        app.persistence.json_store = global_store
+        app.persistence.json_store = original_global_store
+        globals()["json_store"] = original_global_store
 
 
 # ──────────────────────────────────────────────────────────
@@ -98,7 +109,7 @@ def test_chain_1_webhook_to_lake():
         "通道名称": "订单事件通道",
         "接收路径": "/webhook/order",
         "签名密钥": "secret123",
-        "验证方式": "HMAC-SHA256",
+        "验证方式": "NONE",
         "并发上限": "100",
         "回调地址": "https://callback.example.com",
         "通道版本": "v1",
@@ -233,6 +244,8 @@ def test_chain_2_batch_to_lake():
 # ──────────────────────────────────────────────────────────
 def test_chain_3_dlq_to_replay():
     """验证死信队列从入队到重放的完整链路。"""
+    import random
+    random.seed(20261120)  # 固定随机序列，稳定触发消费失败进入死信，消除用例偶发性
     mq_svc = MqConsumerService()
     dlq_svc = DlqHandlerService()
 

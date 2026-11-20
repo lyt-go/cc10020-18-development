@@ -30,6 +30,32 @@ class DlqHandlerService(BaseModuleService):
         super().__init__()
         self._replay_history: list[dict[str, Any]] = []
 
+    # ──────────────────────────────────────────────────────────
+    # 处置台账：死信全生命周期处置依据（重放/复核/质检/结案统一留痕）
+    # ──────────────────────────────────────────────────────────
+    LEDGER_MODULE = "dlq_disposition_ledger"
+
+    def append_disposition(self, dlq_id: int, basis_type: str, conclusion: str,
+                           detail: dict[str, Any] | None = None) -> dict[str, Any]:
+        """向死信处置台账追加一条不可变处置依据。
+
+        basis_type 取值：重放凭证 / 复核导入 / 质量校验 / 质检结案。
+        台账只追加不改写，保证同一条死信的多份处置依据都可回查。
+        """
+        entry = {
+            "dlq_id": dlq_id,
+            "basis_type": basis_type,
+            "conclusion": conclusion,
+            "detail": detail or {},
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return json_store.insert(self.LEDGER_MODULE, entry)
+
+    def get_disposition_ledger(self, dlq_id: int) -> list[dict[str, Any]]:
+        """读取单条死信的全部处置依据，按登记时间排序。"""
+        rows = [r for r in json_store.get_all(self.LEDGER_MODULE) if r.get("dlq_id") == dlq_id]
+        return sorted(rows, key=lambda r: r.get("created_at", ""))
+
     def enqueue_dead_letter(self, source_queue: str, original_message: str,
                             failure_reason: str, consumer_id: int = 0) -> dict[str, Any]:
         """将消费失败的消息加入死信队列。
@@ -75,6 +101,14 @@ class DlqHandlerService(BaseModuleService):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "_fingerprint": msg_fingerprint,
             "_consumer_id": consumer_id,
+            # 完整原始载荷单独留存：复核包导出与质检都以此为准，不随列表预览截断
+            "_full_payload": original_message,
+            # 处置历史（轻量时间线，完整依据见 dlq_disposition_ledger）
+            "_disposition_history": [{
+                "action": "入队",
+                "basis": failure_reason,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }],
         }
 
         # 填充LIST_FIELDS中的其他字段
@@ -162,6 +196,24 @@ class DlqHandlerService(BaseModuleService):
             success = random.random() < 0.7
 
             if success:
+                ack_at = datetime.now(timezone.utc)
+                # 消费凭证：重放成功即视为消息已被下游确认消费，后续任何复核包导入都不得重新投递
+                ack_receipt = {
+                    "receipt_no": f"ACK-{batch_id.split('-', 1)[1]}-{dlq_id:05d}",
+                    "batch_id": batch_id,
+                    "dlq_id": dlq_id,
+                    "record_no": entry.get("记录编号", ""),
+                    "source_queue": entry.get("原始队列", ""),
+                    "consumer_group": f"replay-{entry.get('_consumer_id', 0)}",
+                    "acknowledged_at": ack_at.isoformat(),
+                    "message_fingerprint": entry.get("_fingerprint", ""),
+                }
+                history = list(entry.get("_disposition_history", []))
+                history.append({
+                    "action": "重放确认",
+                    "basis": f"批次 {batch_id} 已获消费确认 {ack_receipt['receipt_no']}",
+                    "at": ack_at.isoformat(),
+                })
                 json_store.update(self.MODULE, dlq_id, {
                     "status": "已重放",
                     "处置状态": "已重放",
@@ -169,17 +221,33 @@ class DlqHandlerService(BaseModuleService):
                     "abnormal": False,
                     "重放批次": batch_id,
                     "重试次数": str(int(entry.get("重试次数", "0") or "0") + 1),
-                    "replayed_at": datetime.now(timezone.utc).isoformat(),
+                    "replayed_at": ack_at.isoformat(),
+                    "_ack_receipt": ack_receipt,
+                    "_disposition_history": history,
                 })
+                # 台账留痕：重放凭证是与质量复核并列的第一类处置依据
+                self.append_disposition(
+                    dlq_id, basis_type="重放凭证",
+                    conclusion=f"重放批次 {batch_id} 已获消费确认",
+                    detail=ack_receipt,
+                )
                 replayed += 1
-                results.append({"dlq_id": dlq_id, "ok": True, "message": "重放成功"})
+                results.append({"dlq_id": dlq_id, "ok": True, "message": "重放成功",
+                                "ack_receipt": ack_receipt})
             else:
                 # 重放失败：重试计数+1，保持待处置
+                history = list(entry.get("_disposition_history", []))
+                history.append({
+                    "action": "重放失败",
+                    "basis": "重放执行失败，保持待处置",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                })
                 json_store.update(self.MODULE, dlq_id, {
                     "重试次数": str(int(entry.get("重试次数", "0") or "0") + 1),
                     "status": "待处置",
                     "失败原因": entry.get("失败原因", "") + " [重放重试]",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "_disposition_history": history,
                 })
                 replay_failed += 1
                 results.append({"dlq_id": dlq_id, "ok": False, "reason": "重放执行失败"})
@@ -217,6 +285,13 @@ class DlqHandlerService(BaseModuleService):
             "results": results,
         }
 
+    def get_full_payload(self, dlq_id: int) -> str | None:
+        """读取死信的完整原始消息载荷（复核导出/质检校验的权威数据源）。"""
+        entry = json_store.get_by_id(self.MODULE, dlq_id)
+        if entry is None:
+            return None
+        return entry.get("_full_payload") or entry.get("原始消息体", "")
+
     def get_dlq_stats(self) -> dict[str, Any]:
         """获取死信队列的全局统计信息。"""
         rows = json_store.get_all(self.MODULE)
@@ -248,6 +323,7 @@ class DlqHandlerService(BaseModuleService):
                 by_status[s] += 1
 
         analysis = self.analyze_failure_reasons()
+        ledger_rows = json_store.get_all(self.LEDGER_MODULE)
         return {
             "module": self.MODULE,
             "entity": self.ENTITY,
@@ -257,5 +333,7 @@ class DlqHandlerService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "total_replays": len(self._replay_history),
             "failure_categories": analysis.get("categories", {}),
+            "disposition_ledger_entries": len(ledger_rows),
+            "acknowledged_dlq": sum(1 for r in rows if r.get("_ack_receipt")),
             "operation": self.OPERATION_TERM,
         }

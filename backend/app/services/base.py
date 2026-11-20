@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.store import store
+from app.persistence import json_store
 
 
 class BaseModuleService:
@@ -24,7 +24,7 @@ class BaseModuleService:
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = list(store.rows(self.MODULE))
+        rows = list(json_store.get_all(self.MODULE))
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
                 rows = [
@@ -41,7 +41,7 @@ class BaseModuleService:
         return rows[start:start + size], total
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return store.find(self.MODULE, entry_id)
+        return json_store.get_by_id(self.MODULE, entry_id)
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
@@ -50,17 +50,17 @@ class BaseModuleService:
         ]
         if missing:
             return None, missing
-        rows = store.rows(self.MODULE)
+        rows = json_store.get_all(self.MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
-        rows.append(entry)
+        json_store.insert(self.MODULE, entry)
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry = store.find(self.MODULE, entry_id)
+        entry = json_store.get_by_id(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
         target = self.ACTION_RULES.get(action)
@@ -69,11 +69,16 @@ class BaseModuleService:
         entry["status"] = target
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        json_store.update(self.MODULE, entry_id, {
+            "status": entry["status"],
+            "pending": entry["pending"],
+            "abnormal": entry["abnormal"],
+        })
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""
-        rows = store.rows(self.MODULE)
+        rows = json_store.get_all(self.MODULE)
         by_status = {
             status: sum(1 for row in rows if row.get("status") == status)
             for status in self.STATUS_ORDER
